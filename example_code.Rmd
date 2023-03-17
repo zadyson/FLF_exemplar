@@ -1,0 +1,1132 @@
+---
+title: "Ancestral_state_reconstruction_gt11_dated_v16"
+author: "Zoe A. Dyson, zoe.dyson(at)lshtm.ac.uk"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  prettydoc::html_pretty:
+    theme: cayman
+    number_sections: TRUE
+    fig_width: 8.27
+    fig_height: 11.69
+---
+
+## Setup knitr
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+knitr::opts_chunk$set(cache=TRUE)
+
+knitr::opts_chunk$set(external=FALSE)
+```
+
+
+## Load packages & track versions
+```{r load_packages}
+# R version
+R.Version()$version.string
+
+# Wrangling
+library(tidyverse)
+packageVersion("tidyverse")
+
+library(lubridate)
+packageVersion("lubridate")
+
+library(stringr)
+packageVersion("stringr")
+
+# Phylo
+library(phangorn)
+packageVersion("phangorn")
+
+library(phytools)
+packageVersion("phytools")
+
+library(ape)
+packageVersion("ape")
+
+library(treeio)
+packageVersion("treeio")
+
+library(NELSI)
+packageVersion("NELSI")
+
+# Phylo plotting
+library(ggtree)
+packageVersion("ggtree")
+
+# Colours
+library(RColorBrewer)
+packageVersion("RColorBrewer")
+
+library(dichromat)
+packageVersion("dichromat")
+
+# Reporting
+library(knitr)
+packageVersion("knitr")
+
+library(prettydoc)
+packageVersion("prettydoc")
+
+```
+
+
+## Setup R environment & functions
+```{r setup_r_env_functions}
+
+# Define `not in` operator
+`%notin%` <- Negate(`%in%`)
+
+
+# Define get AMR state (AMR or no AMR) function
+getNodeStateAMR <- function(user_node_number, user_amr_asr_summary){
+  inf_node_state <- user_amr_asr_summary %>%
+    filter(Node_number==paste0(user_node_number)) %>%
+    select(amr_pres_abs) %>%
+    pull()
+  # Return 1 for AMR at the node, 0 for no AMR
+  return(inf_node_state)
+}
+
+
+# Define custom get function for Parent node AMR state (AMR or no AMR) 
+# Separate function from getNodeStateAMR() required for root node handling
+getParentStateAMR <- function(user_tree, user_node_number, user_amr_asr_summary){
+  # Check if the node is the root node
+  if(paste0(user_node_number)==getRoot(user_tree)){
+    # Report if the node is the root node (does not have parents)
+    inf_parent_node_state <- "root"
+  }else{
+    # Get parent node number (if not root)
+    inf_parent_node_num <- Ancestors(user_tree,user_node_number,type="parent")
+    # Get parent node AMR state
+    inf_parent_node_state <- user_amr_asr_summary %>%
+      filter(Node_number==paste0(inf_parent_node_num)) %>%
+      select(amr_pres_abs) %>%
+      pull()
+  }
+  # Return 1 for AMR at the parent node, 0 for no AMR
+  return(inf_parent_node_state)
+}
+
+
+# Define get function for parent geography (country or region)
+# Separate function required for root node handling
+getParentGeographyState <- function(user_tree, user_node_number,
+                                    user_geo_asr_summary_data, user_geo_level){
+  # Check if the node is the root node
+  if(paste0(user_node_number)==getRoot(user_tree)){
+    # Report if the node is the root node (does not have parents)
+    inf_parent_state <- "root (no parent)"
+  }else{
+    # If node is not the root, get the parent node number
+    inf_ancestor <- Ancestors(user_tree, user_node_number, type = "parent")
+    # If level is country, get `winner` country for the node
+    if (user_geo_level=="country"){
+      inf_parent_state <- user_geo_asr_summary_data %>%
+        filter(Node_number==inf_ancestor) %>%
+        select(Country_Origin) %>%
+        pull()
+      # If level is region, get `winner` region for the node
+    }else{
+      inf_parent_state <- user_geo_asr_summary_data %>%
+        filter(Node_number==inf_ancestor) %>%
+        select(Region) %>%
+        pull() 
+    }
+  }
+  # Return 'winner' location information for the node
+  return(inf_parent_state)
+}
+
+
+# Define get node age HPDs function
+getNodeAgeHPDs <- function(user_tree, user_mrsd, user_node_number){
+  # Tabulate tree params, select heights (in list format) for node
+  inf_height_hpds <- fortify(user_tree) %>%
+    filter(node==paste0(user_node_number)) %>%
+    select(height_0.95_HPD) %>%
+    pull()
+  # Extract upper and lower 95% HPD estimates from list
+  inf_height_hpds <- inf_height_hpds[[1]]
+  inf_height_hpds_lower <- strsplit(inf_height_hpds, " ")[[1]]
+  inf_height_hpds_upper <- strsplit(inf_height_hpds, " ")[[2]]
+  # Convert raw height HPDs to years
+  inf_height_hpds_upper <- as.numeric(user_mrsd) - as.numeric(inf_height_hpds_upper)
+  inf_height_hpds_lower <- as.numeric(user_mrsd) - as.numeric(inf_height_hpds_lower)
+  # Return upper and lower bounds of 95% HPDs in years
+  return(as.list(c(inf_height_hpds_lower, inf_height_hpds_upper)))
+}
+
+
+# Define tip date retrieval function, that specifies if a node is internal
+getTipDate <- function(user_tree, user_node_number){
+  # Get tip label
+  inf_tip_label <- fortify(user_tree) %>%
+    filter(node==user_node_number) %>%
+    select(label) %>%
+    pull()
+  # Get tip Year
+  inf_year <- meta %>%
+    filter(TGC_sangerlane==inf_tip_label) %>%
+    select(Year) %>%
+    pull()
+  # Check if node is internal & update inferred year variable if it is
+  if (length(inf_year)==0){
+    inf_year <- "internal node"
+  }
+  # Return tip date or "internal node" designation
+  return(inf_year)
+}
+
+
+# Define custom get parent node number function for root node handling
+getParentNodeNum <- function(user_tree, user_node_number){
+  # Get parent node number
+  inf_ancestor_node_number <- Ancestors(user_tree, user_node_number, type="parent")
+  # Check if parent is root & designate "root"
+  if (inf_ancestor_node_number == 0){
+    inf_ancestor_node_number <- "root (no parent)"
+  }
+  # Return parent node number
+  return(inf_ancestor_node_number)
+}
+
+
+# Define get geography ASR probability for a node function
+getGeographyProb <- function(user_node_number, user_geo_asr_summary_data){
+  # Get node probability
+  inf_geo_prob <- user_geo_asr_summary_data %>%
+    filter(Node_number == user_node_number) %>%
+    select(prob) %>%
+    pull()
+  # Return node probability
+  return(inf_geo_prob)
+}
+
+
+# Define get AMR ASR probability for a node function
+getAMRProb <- function(user_node_number, user_amr_asr_summary_data){
+  # Get node probability
+  inf_amr_prob <- user_amr_asr_summary_data %>%
+    filter(Node_number == user_node_number) %>%
+    select(prob) %>%
+    pull()
+  # Return node probability
+  return(inf_amr_prob)
+}
+
+
+# Define custom get tip name function for handling internal nodes 
+getTipName <- function(user_node_number,user_tree){
+  # Check if node is a tip node
+  inf_is_tip_node <- isTip(as.phylo(user_tree), user_node_number)
+  tip_name <- "blank"
+  # If node is a tip, return tip name
+  if (inf_is_tip_node==TRUE){
+    inf_tip_name <- user_tree$tip.label[user_node_number]
+    # If node is internal, designate as such
+  }else{
+    inf_tip_name <- "internal"
+  }
+  # Return tip name or "internal"
+  return(inf_tip_name)
+}
+
+
+# Define custom get MRCA function for handling BactDate tree format 
+getMRCA <- function(user_mrsd,user_tree){
+  # Get oldest (mrca) node age
+  inf_max_node_time <- max(allnode.times(user_tree@phylo))
+  # Convert oldest node age to years using most recent sample date
+  inf_mrca <- as.numeric(user_mrsd)-as.numeric(inf_max_node_time) 
+  # Return mrca date in decimal years
+  return(inf_mrca)
+}
+
+
+# Define custom get node age function for handling BactDate tree format
+getNodeAge <- function(user_node_number,user_mrsd,user_tree){
+  
+  # Get oldest (mrca) node age for calibration of BactDate ages
+  inf_mrca_raw_age <- max(allnode.times(user_tree@phylo))
+  
+  # Get raw node age data from tabulated BactDate tree data
+  inf_node_x_coord <- fortify(user_tree) %>%
+    filter(node==paste0(user_node_number)) %>%
+    select(x) %>%
+    pull()
+  
+  # Convert BactDate raw age to decimal years using mrca & mrsd
+  inf_node_age <- as.numeric(user_mrsd) - as.numeric(inf_mrca_raw_age) +
+    as.numeric(inf_node_x_coord)  
+  
+  # Return node age in decimal years
+  return(inf_node_age)
+}
+
+# Get CipIR state for a given node
+getCipNodeState <- function(user_node_number, 
+                            user_amr_det_list, 
+                            user_file_genotype){
+  
+  # get all Cip AMR dets in the dataset
+  all_cip_dets <-  user_amr_det_list %>%
+    as_tibble() %>%
+    filter(grepl(pattern = 'gyr|par|qnr|Qnr|Cip|cip', value)) %>%
+    pull()
+  
+  # Create empty strings ans lists to build Cip state data for a given node
+  cip_node_state_pres_dets_only <- NULL
+  cip_node_state_output <- NULL
+  
+  # Check if the node is the root node
+  if(user_node_number=="root (no parent)"){
+    # Report if the node is the root node (does not have parents)
+    cip_node_state_pres_dets_only <- "root (no parent)"
+    
+    # If the node is not the root get the Cip state
+  }else{
+    # Summarise presence/absence data for each Cip determinant
+    for(cip_det in 1:length(all_cip_dets)){
+      
+      # Reset Cip determinant state variable at the start of each iteration
+      cip_det_state_pres_abs <- NULL
+      
+      # Open relevant Cip reconstruction file
+      cip_det_asr <- read_csv(paste0("~/Dropbox/2021_TGC_WG2/ASR_v2/dated_trees/gt",
+                                     user_file_genotype,"_asr_output_dated/amr_events_summary",
+                                     "/States_nodes_ML_reconstruction_AMR_",all_cip_dets[cip_det],
+                                     ".csv"))
+      
+      # Get Cip state for the given node & determinant
+      cip_det_state_pres_abs <- cip_det_asr  %>%
+        filter(Node_number == paste0(user_node_number)) %>%
+        select(amr_pres_abs) %>%
+        pull()
+      
+      # Aggregate a list of Cip determinants present at the node
+      if (cip_det_state_pres_abs==1){
+        cip_node_state_pres_dets_only <- c(cip_node_state_pres_dets_only, 
+                                           all_cip_dets[cip_det])
+      }
+    }
+  }
+  
+  # Return the strings of Cip determinants present at the given node
+  # If Cip determinants are present concatenate to string format
+  if (grepl(pattern = 'gyr|par|qnr|Qnr|Cip|cip', str_c(cip_node_state_pres_dets_only, collapse = " "))){
+    cip_node_state_output <- str_c(cip_node_state_pres_dets_only, collapse = " ")
+    # Handle root node
+  }else if(grepl(pattern = 'root', str_c(cip_node_state_pres_dets_only, collapse = " "))){
+    cip_node_state_output <- cip_node_state_pres_dets_only
+    # Handle no Cip determinants 
+  }else{
+    cip_node_state_output <- "None"
+  }
+  return(cip_node_state_output)
+}
+
+
+```
+
+
+## Set genotype
+```{r set_genotype}
+
+# Set genotype
+genotype <- "1.1"
+
+# Remove full stops for file path grep in next code block
+file_genotype <- gsub("\\.","",genotype)
+
+```
+
+
+## Import data
+```{r import_data}
+
+# Set working dir
+setwd("~/Dropbox/2021_TGC_WG2/ASR_v2/dated_trees/")
+
+# Import metadata
+meta <- read_csv("Final_data_20220315_Gul2017.csv")
+
+# Update regions where country is unknown from NA to "Not Provided"
+meta <- meta %>%
+  mutate(Region = ifelse(Country_Origin == "Not Provided", "Not Provided", Region))
+
+# Import ML tree (updated to allow for v2)
+filename_pattern = paste0("^gt",file_genotype,"_BacDat_.*_BEAST.*tree$")
+filename <- list.files()[grepl(pattern = filename_pattern,list.files())]
+try(tree <- read.beast(filename))
+
+# Set tree type variable for output file
+tree_type <- "dated"
+
+```
+
+
+## Wrangle data
+```{r wrangle_data}
+
+# Remove # from lane ids in tree and metadata
+tree@phylo$tip.label <- gsub("#","_",tree@phylo$tip.label)
+meta <- meta %>% 
+  mutate(TGC_sangerlane = gsub("#","_",TGC_sangerlane))
+
+# Merge nested genotypes
+meta <- meta %>%
+  mutate(merged_genotype = Final_genotype) %>%
+  mutate(merged_genotype = ifelse(merged_genotype=="2.1.7.1", "2.1.7",merged_genotype)) %>%
+  mutate(merged_genotype = ifelse(merged_genotype=="2.1.7.2", "2.1.7",merged_genotype)) %>%
+  mutate(merged_genotype = ifelse(merged_genotype=="2.1.7.2", "2.1.7",merged_genotype)) %>%
+  mutate(merged_genotype = ifelse(merged_genotype=="3.3.2.Bd1", "3.3.2",merged_genotype)) %>%
+  mutate(merged_genotype = ifelse(merged_genotype=="3.3.2.Bd2", "3.3.2",merged_genotype)) %>%
+  mutate(merged_genotype = ifelse(merged_genotype=="4.3.1.1.P1", "4.3.1.1",merged_genotype)) %>%
+  mutate(merged_genotype = ifelse(merged_genotype=="4.3.1.1.EA1", "4.3.1.1",merged_genotype)) %>%
+  mutate(merged_genotype = ifelse(merged_genotype=="4.3.1.2.EA2", "4.3.1.2",merged_genotype)) %>%
+  mutate(merged_genotype = ifelse(merged_genotype=="4.3.1.2.EA3", "4.3.1.2",merged_genotype)) %>%
+  mutate(merged_genotype = ifelse(merged_genotype=="4.3.1.3.Bdq", "4.3.1.3",merged_genotype))
+
+# Get genotype data subsets
+gt_and_outgroups_meta <- meta %>%
+  mutate(TGC_sangerlane = gsub("#","_",TGC_sangerlane)) %>%
+  filter(TGC_sangerlane %in% tree@phylo$tip.label) %>%
+  mutate(outgroup = ifelse(merged_genotype != genotype, "outgroup","ingroup"))
+
+gt_meta <- gt_and_outgroups_meta %>%
+  filter(merged_genotype==genotype) %>%
+  filter(TGC_sangerlane %in% tree@phylo$tip.label)
+
+gt_tips <- gt_meta %>%
+  select(TGC_sangerlane) %>%
+  pull()
+
+gt_outgroups <- gt_and_outgroups_meta %>%
+  filter(outgroup=="outgroup") %>%
+  select(TGC_sangerlane) %>%
+  pull()
+
+gt_amr <- gt_meta %>%
+  select(TGC_sangerlane,ampC:parE_L416F, MDR, XDR, cipIR, cipR, aziR, CEP) %>%
+  # Make categorical AMR binary for compatibility with individual determinants
+  mutate(MDR = ifelse(MDR,1,0)) %>%
+  mutate(XDR = ifelse(XDR,1,0)) %>%
+  mutate(cipIR = ifelse(cipIR,1,0)) %>%
+  mutate(cipR = ifelse(cipR,1,0)) %>%
+  mutate(aziR = ifelse(aziR,1,0)) %>%
+  mutate(CEP = ifelse(CEP,1,0)) %>%
+  select(TGC_sangerlane, where( ~ is.numeric(.x) && sum(.x) != 0))
+
+# Extract Country of origin & give each a numerical identifier for reconstructions
+gt_country <- gt_meta %>%
+  select(TGC_sangerlane, Country_Origin)
+
+# Get mrsd for plotting
+mrsd <- gt_meta %>%
+  select(Year) %>%
+  summarise(max(Year)) %>%
+  pull() %>% 
+  as.numeric() %>%
+  decimal2Date() %>%
+  decimal_date()
+
+# Get node numbers for ggtree
+edge <- data.frame(tree@phylo$edge, edge_num=1:nrow(tree@phylo$edge))
+colnames(edge) <- c("parent", "node", "edge_num")
+
+# Plot entire tree
+ggtree(tree, mrsd=paste0(mrsd,"-01-07")) %<+% 
+  as.data.frame(gt_and_outgroups_meta) %<+% edge + 
+  geom_tippoint(aes(color=outgroup), size=2) + 
+  scale_colour_brewer(palette = "Set2") + 
+  theme_tree2()
+
+# Plot entire tree with internal nodes labelled
+ggtree(tree, mrsd=paste0(mrsd,"-01-07")) %<+% 
+  as.data.frame(gt_and_outgroups_meta) %<+% edge + 
+  geom_tippoint(aes(color=outgroup), size=2) + 
+  geom_label(aes(x=branch, label=node)) + 
+  scale_colour_brewer(palette = "Set2") + 
+  theme_tree2()
+
+# Make working dir
+# Create output directory if it doesn't exist
+genotype_dir <- paste0("gt",file_genotype,"_asr_output_dated")
+if (!dir.exists(genotype_dir)) {dir.create(genotype_dir)}
+setwd(genotype_dir)
+
+
+```
+
+
+## Reconstruct AMR (ML)
+```{r ml_reconstruct_amr}
+
+# Reset working dir
+setwd(paste0("~/Dropbox/2021_TGC_WG2/ASR_v2/dated_trees/gt",file_genotype,"_asr_output_dated"))
+
+# ace doesn't like 0 length branches so set zero-length branches 
+# to be 1/1000000 total tree length
+tree_ace <- tree@phylo
+tree_ace$edge.length[tree_ace$edge.length==0]<-max(nodeHeights(tree_ace))*1e-6
+
+# Plot tree with internal node numbers labelled
+plot.phylo(ladderize(tree_ace), no.margin=T, show.tip.label=T,
+           show.node.label=T, cex=1)
+nodelabels(cex=1)
+
+# Order data to match order of tips
+gt_amr_ordered <- gt_amr %>%
+  slice(match(tree_ace$tip.label, TGC_sangerlane))
+
+# Create output directory if it doesn't exist
+raw_amr_asr_output_dir <- "raw_ml_amr_asr_output"
+if (!dir.exists(raw_amr_asr_output_dir)) {dir.create(raw_amr_asr_output_dir)}
+setwd(raw_amr_asr_output_dir)
+
+# Make colour dictionary
+amr_cols <- c("red","blue")
+names(amr_cols) <- c("0","1")
+
+# Iterate through each AMR determinant and reconstruct each
+for (amr_det in 2:(ncol(gt_amr_ordered))){  #from 2 for lane id column
+  
+  # Make named character vector of traits 
+  gt_amr_vct <- gt_amr_ordered %>%
+    select(TGC_sangerlane ,names(gt_amr_ordered)[amr_det]) %>%
+    deframe() %>%
+    as.factor()
+  
+  # Run ace reconstruction
+  # Note marginal should be set to F (the default so no adjustment needed)
+  gt_amr_reconstruction_ml <- ace(gt_amr_vct, tree_ace, type="discrete", 
+                                  method="ML")
+  
+  # Plot reconstruction
+  plotTree(tree_ace,fsize=0.8)
+  nodelabels(node=1:tree_ace$Nnode+Ntip(tree_ace),
+             pie=gt_amr_reconstruction_ml$lik.anc,piecol=amr_cols,cex=0.5)
+  tiplabels(pie=to.matrix(gt_amr_vct,sort(unique(gt_amr_vct))),cex=0.3)
+  add.simmap.legend(colors=amr_cols,prompt=FALSE,x=40,y=3)
+  title(main=paste0("ML reconstruction of ",names(gt_amr_ordered)[amr_det]))
+  
+  # Output ML AMR reconstruction data
+  # Add internal node numbers to output
+  gt_amr_reconstruction_ml_results <- gt_amr_reconstruction_ml$lik.anc %>%
+    as.data.frame()
+  gt_amr_reconstruction_ml_results$Node_number <- 
+    rep((length(tree_ace$tip.label) + 1):
+          (dim(gt_amr_reconstruction_ml_results)[1]+length(tree_ace$tip.label)))
+  
+  # Write file
+  write.csv(gt_amr_reconstruction_ml_results,
+            file=paste0("Raw_ML_reconstruction_AMR_", 
+                        names(gt_amr_ordered)[amr_det], ".csv"),
+            quote=F, row.names=T)
+  
+}  
+
+```
+
+
+## Reconstruct country (ML)
+```{r ml_reconstruct_country}
+
+# Reset working dir
+setwd(paste0("~/Dropbox/2021_TGC_WG2/ASR_v2/dated_trees/gt",file_genotype,"_asr_output_dated"))
+
+# Create output directory if it doesn't exist
+raw_country_ml_asr_output_dir <- "raw_ml_country_asr_output"
+if (!dir.exists(raw_country_ml_asr_output_dir)) {dir.create(raw_country_ml_asr_output_dir)}
+setwd(raw_country_ml_asr_output_dir)
+
+# Get country info 
+gt_country_country <- gt_meta %>%
+  filter(TGC_sangerlane %in% tree_ace$tip.label)
+
+# Order data to match order of tips
+gt_country_ordered <- gt_country_country %>%
+  slice(match(tree_ace$tip.label, TGC_sangerlane))
+
+# Make named character vector of traits 
+gt_country_vct <- gt_country_ordered %>%
+  group_by(Country_Origin) %>%
+  select(TGC_sangerlane, Country_Origin) %>%
+  deframe() %>%
+  as.factor()
+
+# Make colour dictionary for each country region
+country_cols <- setNames(as.vector(colorRampPalette(brewer.pal(12,"Set3"))(length(unique(gt_country_vct)))),
+                         levels(gt_country_vct))
+
+# Run ace reconstruction
+# Note marginal should be set to F (the default so no adjustment needed)
+gt_country_reconstruction_ml <- ace(gt_country_vct, tree_ace, type="discrete", 
+                                    method="ML")
+
+# Plot reconstruction
+plotTree(tree_ace,fsize=0.8)
+nodelabels(node=1:tree_ace$Nnode+Ntip(tree_ace),
+           pie=gt_country_reconstruction_ml$lik.anc,piecol=country_cols,cex=0.5)
+tiplabels(pie=to.matrix(gt_country_vct,sort(unique(gt_country_vct))),piecol=country_cols,cex=0.3)
+add.simmap.legend(colors=country_cols,prompt=FALSE,x=40,y=3)
+title(main=paste0("ML country reconstruction"))
+
+# Add internal node numbers to output
+gt_country_reconstruction_ml_results <- gt_country_reconstruction_ml$lik.anc %>%
+  as.data.frame()
+gt_country_reconstruction_ml_results$Node_number <- rep((length(tree_ace$tip.label) + 1):(dim(gt_country_reconstruction_ml_results)[1]+length(tree_ace$tip.label)))
+
+# Output ASR data
+write.csv(gt_country_reconstruction_ml_results, 
+          file="Raw_ML_reconstruction_Country.csv", 
+          quote=F, row.names=T)
+
+```
+
+
+## Reconstruct region (ML)
+```{r ml_reconstruct_region}
+
+# Reset working dir
+setwd(paste0("~/Dropbox/2021_TGC_WG2/ASR_v2/dated_trees/gt",file_genotype,"_asr_output_dated"))
+
+# Create output directory if it doesn't exist
+raw_region_ml_asr_output_dir <- "raw_ml_region_asr_output"
+if (!dir.exists(raw_region_ml_asr_output_dir)) {dir.create(raw_region_ml_asr_output_dir)}
+setwd(raw_region_ml_asr_output_dir)
+
+# Get region info 
+gt_region_region <- gt_meta %>%
+  filter(TGC_sangerlane %in% tree_ace$tip.label)
+
+# Order data to match order of tips
+gt_region_ordered <- gt_region_region %>%
+  slice(match(tree_ace$tip.label, TGC_sangerlane))
+
+# Make named character vector of traits 
+gt_region_vct <- gt_region_ordered %>%
+  group_by(Region) %>%
+  select(TGC_sangerlane, Region) %>%
+  deframe() %>%
+  as.factor()
+
+# Make colour dictionary for each region region
+region_cols <- setNames(as.vector(colorRampPalette(brewer.pal(12,"Set3"))(length(unique(gt_region_vct)))),
+                        levels(gt_region_vct))
+
+
+# Run ace reconstruction
+# Note marginal should be set to F (the default so no adjustment needed)
+gt_region_reconstruction_ml <- ace(gt_region_vct, tree_ace, type="discrete", 
+                                   method="ML")
+
+# Plot reconstruction
+plotTree(tree_ace,fsize=0.8)
+nodelabels(node=1:tree_ace$Nnode+Ntip(tree_ace),
+           pie=gt_region_reconstruction_ml$lik.anc,piecol=region_cols,cex=0.5)
+tiplabels(pie=to.matrix(gt_region_vct,sort(unique(gt_region_vct))),piecol=region_cols,cex=0.3)
+add.simmap.legend(colors=region_cols,prompt=FALSE,x=40,y=3)
+title(main=paste0("ML region reconstruction"))
+
+# Add internal node numbers to output
+gt_region_reconstruction_ml_results <- gt_region_reconstruction_ml$lik.anc %>%
+  as.data.frame()
+gt_region_reconstruction_ml_results$Node_number <- rep((length(tree_ace$tip.label) + 1):(dim(gt_region_reconstruction_ml_results)[1]+length(tree_ace$tip.label)))
+
+# Output asr data
+write.csv(gt_region_reconstruction_ml_results, file="Raw_ML_reconstruction_region.csv",
+          quote=F, row.names=T)
+
+```
+
+
+## Summarise AMR events with geography & time
+```{r summarise_amr_events_ml}
+
+# Set working directory 
+setwd(paste0("~/Dropbox/2021_TGC_WG2/ASR_v2/dated_trees/gt",file_genotype,"_asr_output_dated"))
+
+# Create output directory if it doesn't exist
+amr_events_asr_output_dir <- "amr_events_summary"
+if (!dir.exists(amr_events_asr_output_dir)) {dir.create(amr_events_asr_output_dir)}
+setwd(amr_events_asr_output_dir)
+
+# Load Country info
+country_asr_raw <- read_csv(paste0("~/Dropbox/2021_TGC_WG2/ASR_v2/dated_trees/gt",file_genotype,
+                                   "_asr_output_dated/",raw_country_ml_asr_output_dir,
+                                   "/Raw_ML_reconstruction_Country.csv"))
+
+# Load Region info
+region_asr_raw <- read_csv(paste0("~/Dropbox/2021_TGC_WG2/ASR_v2/dated_trees/gt",file_genotype,
+                                  "_asr_output_dated/",raw_region_ml_asr_output_dir,
+                                  "/Raw_ML_reconstruction_region.csv"))
+
+# Call country winners at internal nodes
+country_asr_summary <- country_asr_raw %>%
+  select(-1) %>%
+  group_by(Node_number) %>%
+  gather(Country_Origin, prob, 1:ncol(.)-1) %>%
+  slice(which.max(prob)) %>%
+  mutate(TGC_sangerlane = "internal") %>%
+  mutate(isTip = F) %>%
+  select(Node_number, TGC_sangerlane, isTip, Country_Origin, prob)
+
+# Call region winners at internal nodes
+region_asr_summary <- region_asr_raw %>%
+  select(-1) %>%
+  group_by(Node_number) %>%
+  gather(Region, prob, 1:ncol(.)-1) %>%
+  slice(which.max(prob)) %>%
+  mutate(TGC_sangerlane = "internal") %>%
+  mutate(isTip = F) %>%
+  select(Node_number, TGC_sangerlane, isTip,
+         Region,prob)
+
+# Check there aren't any ties (output should be true for both)
+nrow(country_asr_summary) == length(unique(country_asr_summary$Node_number))
+nrow(region_asr_summary) == length(unique(region_asr_summary$Node_number))
+
+# Add tip details
+country_tips <- fortify(tree_ace) %>%
+  rename(TGC_sangerlane = label) %>%
+  left_join(meta) %>%
+  select(node, TGC_sangerlane, isTip, Country_Origin) %>%
+  filter(isTip == T) %>%
+  mutate(prob=1) %>%
+  rename(Node_number = node)
+
+region_tips <- fortify(tree_ace) %>%
+  rename(TGC_sangerlane = label) %>%
+  left_join(meta) %>%
+  select(node, TGC_sangerlane, isTip, Region) %>%
+  filter(isTip == T) %>%
+  mutate(prob=1) %>%
+  rename(Node_number = node)
+
+# Combine internal and tip info 
+country_asr_summary <- bind_rows(country_tips, country_asr_summary)
+region_asr_summary <- bind_rows(region_tips, region_asr_summary)
+
+# Write summary file
+write.csv(country_asr_summary, file=paste0("States_nodes_ML_reconstruction_Country.csv"), 
+          quote=F, row.names=T)
+write.csv(region_asr_summary, file=paste0("States_nodes_ML_reconstruction_Region.csv"), 
+          quote=F, row.names=T)
+
+
+# Get AMR determinant list for iteration
+amr_det_list <- names(gt_amr_ordered)[-1]
+
+# Iterate through AMR determinants summarise node states
+for (amr_det in 1:length(amr_det_list)){
+  
+  # Open AMR file
+  amr_asr_raw <- read_csv(paste0("~/Dropbox/2021_TGC_WG2/ASR_v2/dated_trees/gt",
+                                 file_genotype,"_asr_output_dated/",raw_amr_asr_output_dir,
+                                 "/Raw_ML_reconstruction_AMR_",amr_det_list[amr_det],
+                                 ".csv"))
+  
+  # Call AMR winner for internal nodes
+  amr_asr_summary <-amr_asr_raw %>%
+    select(-1) %>%
+    group_by(Node_number) %>%
+    gather(amr_pres_abs, prob, 1:ncol(.)-1) %>%
+    slice(which.max(prob)) %>%
+    mutate(TGC_sangerlane = "internal") %>%
+    mutate(isTip = F) %>%
+    select(Node_number, TGC_sangerlane, isTip, amr_pres_abs, prob) %>%
+    type_convert()
+  
+  # Check there aren't any ties (output should be true)
+  nrow(amr_asr_summary) == length(unique(amr_asr_summary$Node_number))
+  
+  # Add tip details
+  tip_details <- fortify(tree_ace) %>%
+    rename(TGC_sangerlane = label) %>%
+    left_join(meta) %>%
+    select(node, TGC_sangerlane, isTip, paste0(amr_det_list[amr_det])) %>%
+    rename(amr_pres_abs = paste0(amr_det_list[amr_det])) %>%
+    filter(isTip == T) %>%
+    mutate(prob=1) %>%
+    rename(Node_number = node) %>%
+    select(Node_number, TGC_sangerlane, isTip, amr_pres_abs, prob) %>%
+    type_convert()
+  
+  # Combine internal and node info 
+  amr_asr_summary <- bind_rows(tip_details, amr_asr_summary)
+  
+  # Write summary file
+  write.csv(amr_asr_summary, 
+            file=paste0("States_nodes_ML_reconstruction_AMR_",
+                        amr_det_list[amr_det],".csv"),
+            quote=F, row.names=T)
+  
+}
+
+# Iterate through AMR determinants summaries events (separate loop for Cip states)
+for (amr_det in 1:length(amr_det_list)){ 
+  
+  # Create empty data frame to be populated with events
+  amr_events <- NULL
+  
+  # Open AMR det file
+  amr_asr_summary <- read_csv(paste0("States_nodes_ML_reconstruction_AMR_",
+                        amr_det_list[amr_det],".csv"))
+  
+  # Get nodes with AMR determinant
+  nodes <- amr_asr_summary %>%
+    select(Node_number) %>%
+    pull()
+  
+  # Summarise events
+  for (current_node in 1:length(nodes)){
+    
+    # init vars
+    node_name <- "none"
+    node_state <- "none"
+    node_is_root <- " none"
+    node_has_amr <- "none"
+    parent_has_amr <- "none"
+    parent_node <- "none"
+    node_country <- "none"
+    node_country_prob <- "none"
+    node_region <- "none"
+    node_region_prob <- "none"
+    node_amr_prob <- "none"
+    parent_amr_prob <- "none"
+    parent_country <- "none"
+    parent_country_prob <- "none"
+    parent_region <- "none"
+    parent_region_prob <- "none"
+    node_date <- "none"
+    node_age <- "none"
+    parent_date <- "none"
+    node_height_hpds_lower <- "none"
+    node_height_hpds_upper <- "none"
+    parent_height_hpds_lower <- "none"
+    parent_height_hpds_upper <- "none"
+    event_type <- "none"
+    country_event_type <- "none"
+    region_event_type <- "none"
+    node_cip_dets <- "none"
+    parent_cip_dets <- "none"
+    
+    # Check if current node is the root node
+    node_is_root <- paste0(nodes[current_node])==getRoot(tree@phylo)
+    
+    # Get node & parent AMR state
+    node_state<- getNodeStateAMR(nodes[current_node], amr_asr_summary)
+    parent_state <- getParentStateAMR(tree_ace, nodes[current_node], 
+                                      amr_asr_summary)
+    
+    # Categorise AMR state change
+    if(node_state == 1 & parent_state==0){
+      event_type <- "gain"
+    }else if (parent_state==node_state & node_state==1){
+      event_type <- "no_change"
+    }else if (node_state == 0 & parent_state == 1){
+      event_type <- "loss"
+    }else if (parent_state == "root" & node_state==1){
+      event_type = "no event (root node)"
+    }else if (parent_state == "root" & node_state==0){
+      event_type = "no event (root node)"
+    }else if (parent_state == 0 & node_state == 0){
+      event_type = "no AMR event"
+    }
+    
+    # Skip reporting for 'no change' when AMR determinants absent
+    if (event_type!="none"){
+      
+      # Check country info
+      if (event_type=="gain" || event_type=="no_change" || 
+          event_type=="loss" || event_type=="no event (root node)" || 
+          event_type == "no AMR event"){
+        
+        # Get node geographical information
+        node_country <- country_asr_summary %>%
+          filter(Node_number==nodes[current_node]) %>%
+          select(Country_Origin) %>%
+          pull()
+        node_region <- region_asr_summary %>%
+          filter(Node_number==nodes[current_node]) %>%
+          select(Region) %>%
+          pull()
+        
+        # Get parent geographical information 
+        parent_country <- getParentGeographyState(tree_ace, 
+                                                  nodes[current_node],
+                                                  country_asr_summary,"country")
+        parent_region <- getParentGeographyState(tree_ace, 
+                                                 nodes[current_node],
+                                                 region_asr_summary,"region")
+        
+        # Categorise as local/imported and gain/transmission
+        # Country level event categorisation
+        if((event_type=="gain") & (node_country==parent_country)){
+          country_event_type <- "local_gain"
+        }else if((event_type=="gain") & (node_country!=parent_country)){
+          country_event_type <- "imported_gain"
+        }else if((event_type=="no_change") & (node_country==parent_country)){
+          country_event_type <- "local_transmission"
+        }else if((event_type=="no_change") & (node_country!=parent_country)){
+          country_event_type <- "international_transmission"
+        }
+        
+        # Region level event categorisation
+        if((event_type=="gain") & (node_region==parent_region)){
+          region_event_type <- "local_gain"
+        }else if((event_type=="gain") & (node_region!=parent_region)){
+          region_event_type <- "imported_gain"
+        }else if((event_type=="no_change") & (node_region==parent_region)){
+          region_event_type <- "local_transmission"
+        }else if((event_type=="no_change") & (node_region!=parent_region)){
+          region_event_type <- "inter-regional_transmission"
+        }
+        
+        # No need to go further for loss events or root node (no parent)
+        if(event_type=="loss" | event_type=="no event (root node)" |
+           event_type == "no AMR event"){
+          country_event_type <- event_type
+          region_event_type <- event_type
+        }        
+        
+        # Get the tip date
+        node_date <- getTipDate(tree_ace,nodes[current_node])
+      }
+      
+      # Get node and AMR info for the event at the current node 
+      node_country_prob <- getGeographyProb(nodes[current_node],country_asr_summary)
+      node_region_prob <- getGeographyProb(nodes[current_node],region_asr_summary)
+      node_name <- getTipName(nodes[current_node],tree_ace)
+      node_amr_prob <- getAMRProb(nodes[current_node],amr_asr_summary)
+      node_has_amr <- if(node_state==1) "Yes" else "No"
+      
+      # If the node is not the root node get parent info
+      if(!node_is_root){
+        parent_node <- getParentNodeNum(tree_ace, nodes[current_node])
+        parent_amr_prob <- getAMRProb(parent_node,amr_asr_summary)
+        parent_country_prob <- getGeographyProb(parent_node,country_asr_summary)
+        parent_region_prob <- getGeographyProb(parent_node,region_asr_summary)
+        parent_has_amr <- if(parent_state==1) "Yes" else "No"
+        parent_node_age <- getNodeAge(parent_node, mrsd, tree)
+        parent_height_hpds <- getNodeAgeHPDs(tree, mrsd, parent_node)
+        parent_height_hpds_lower <- parent_height_hpds[[1]]
+        parent_height_hpds_upper <- parent_height_hpds[[2]]
+        # If the node is the root node, fill parent node info accordingly
+      }else{
+        parent_node <- "root (no parent)"
+        parent_amr_prob <- "root (no parent)"
+        parent_country_prob <- "root (no parent)"
+        parent_region_prob <- "root (no parent)"
+        parent_has_amr <- "root (no parent)"
+        parent_node_age <- "root (no parent)"
+        parent_height_hpds <- "root (no parents)"
+        parent_height_hpds_upper <- "root (no parent)"
+        parent_height_hpds_lower <- "root (no parent)" 
+      }
+      
+      # Get node age and HPDs
+      node_age <- getNodeAge(nodes[current_node], mrsd, tree)
+      node_height_hpds <- getNodeAgeHPDs(tree, mrsd, nodes[current_node])
+      node_height_hpds_lower <- node_height_hpds[[1]]
+      node_height_hpds_upper <- node_height_hpds[[2]]
+      
+      
+      # If Cip determinant event then add Cip states for parent & child to output
+      if (grepl(pattern = 'gyr|par|qnr|Qnr|Cip|cip', amr_det_list[amr_det])){
+        node_cip_dets <- getCipNodeState(nodes[current_node], amr_det_list, file_genotype)
+        parent_cip_dets <- getCipNodeState(getParentNodeNum(tree_ace, nodes[current_node]),
+                                           amr_det_list, file_genotype)
+      }else{
+        node_cip_dets <- "N/A"
+        parent_cip_dets <- "N/A"
+      }
+      # Output event summary for node to data frame
+      amr_events <- rbind(amr_events, c(genotype,
+                                        nodes[current_node],
+                                        node_name,
+                                        node_is_root,
+                                        parent_node,
+                                        amr_det_list[amr_det],
+                                        event_type,
+                                        node_has_amr,
+                                        node_amr_prob,
+                                        parent_has_amr,
+                                        parent_amr_prob,
+                                        node_cip_dets,
+                                        parent_cip_dets,
+                                        node_country,
+                                        node_country_prob,
+                                        parent_country,
+                                        parent_country_prob,
+                                        country_event_type,
+                                        node_region,
+                                        node_region_prob,
+                                        parent_region,
+                                        parent_region_prob,
+                                        region_event_type,                                        
+                                        node_date,
+                                        node_age,
+                                        node_height_hpds_lower,
+                                        node_height_hpds_upper,
+                                        parent_node_age,
+                                        parent_height_hpds_lower,
+                                        parent_height_hpds_upper,
+                                        tree_type))
+    }
+    #Add column names
+    colnames(amr_events) <- c("genotype","node_number","tip_name","root_node",
+                              "parent_node_number", "amr_determinant",
+                              # Note: node_state_amr_prob is for the winning AMR 
+                              # state which could be presence or absence
+                              "event_type","node_has_amr","node_state_amr_prob",
+                              "parent_has_amr","parent_amr_prob",
+                              "node_cip_state","parent_cip_state",
+                              "node_country","node_country_prob","parent_country",
+                              "parent_country_prob","country_event_type","node_region",
+                              "node_region_prob","parent_region","parent_region_prob",
+                              "region_event_type","tip_date","node_age",
+                              "node_age_lower_95HPDs","node_age_upper_95HPDs",
+                              "parent_node_age","parent_node_age_lower_95HPDs",
+                              "parent_node_age_upper_95HPDs",
+                              "tree_type")
+    
+    # Output events summary
+    write.csv(amr_events, 
+              file=paste0("Events_ML_reconstruction_AMR_",
+                          amr_det_list[amr_det],".csv"), quote=F, row.names=T)
+  }
+}
+
+```
+
+
+## Drop tips with unknown location for geo simmap (to get correct frequencies)
+```{r drop_no_geo_tips}
+
+# Get sequence IDs without geographic info
+gt_no_geo <- gt_and_outgroups_meta %>%
+  filter(Country_Origin=="Not Provided") %>%
+  select(TGC_sangerlane) %>%
+  pull()
+
+# Make new geographic ASR tree
+geo_tree <- tree@phylo
+
+# Drop tips without geographic info for simmap  - node numbers do change
+for (tip in 1:length(gt_no_geo)) {
+  geo_tree <- drop.tip(geo_tree, gt_no_geo[tip])
+}
+
+# Plot tree with internal node numbers labelled
+plot.phylo(ladderize(geo_tree), no.margin=T, show.tip.label=T,
+           show.node.label=T, cex=1)
+nodelabels(cex=1)
+
+# Update country info 
+gt_geo_country <- gt_meta %>%
+  filter(TGC_sangerlane %notin% gt_no_geo)
+
+# ace doesn't like 0 length branches so set zero-length branches 
+# to be 1/1000000 total tree length
+geo_tree_ace <- geo_tree
+geo_tree_ace$edge.length[geo_tree_ace$edge.length==0]<-max(nodeHeights(geo_tree_ace))*1e-6
+
+
+```
+
+
+## Make simmap geographic state transition matrix
+```{r geo_state_transition_matrix, error=T}
+
+# Reset working dir
+setwd(paste0("~/Dropbox/2021_TGC_WG2/ASR_v2/dated_trees/gt",file_genotype,"_asr_output_dated"))
+
+# Create output directory if it doesn't exist
+simmap_geo_asr_output_dir <- "simmap_region"
+if (!dir.exists(simmap_geo_asr_output_dir)) {dir.create(simmap_geo_asr_output_dir)}
+setwd(simmap_geo_asr_output_dir)
+
+# Update nodes and meta
+# Order data to match order of tips
+gt_geo_ordered <- gt_geo_country %>%
+  slice(match(geo_tree_ace$tip.label, TGC_sangerlane))
+
+# Make named character vector of traits 
+gt_geo_vct <- gt_geo_ordered %>%
+  group_by(Region) %>%
+  select(TGC_sangerlane, Region) %>%
+  deframe() %>%
+  as.factor()
+
+# Make colour dictionary for each geo region
+geo_cols <- NULL
+geo_cols <- setNames(as.vector(colorRampPalette(brewer.pal(12,"Set3"))(length(unique(gt_geo_vct)))),
+                     levels(gt_geo_vct))
+
+
+
+# Make state transition matrix
+gt_geo_simmap <- make.simmap(geo_tree_ace,gt_geo_vct,model="ER",nsim=10)
+
+# Plot all simulations
+par(mfrow=c(4,3))
+null<-sapply(gt_geo_simmap,plotSimmap,colors=geo_cols,lwd=1,ftype="off")
+par(mfrow=c(1,1))
+
+# Sumamrise 100 simulations
+gt_geo_simmap_summary <-summary(gt_geo_simmap, ref.tree=geo_tree_ace)
+
+# Plot reconstruction
+par(mar = c(2, 2, 2, 2))
+plot(gt_geo_simmap_summary, colors=geo_cols)
+add.simmap.legend(colors=geo_cols,prompt=FALSE,x=40,y=3)
+title(main=paste0("Simmap reconstruction of geography (region) over 100 simulations"))
+
+# Extract transition state matrix
+# calculate mean transitions (x,y ie x->y)
+geo_transition_state_matrix_times <- gt_geo_simmap_summary$times %>%
+  as.data.frame() %>%
+  summarise(across(levels(gt_geo_vct), mean))
+
+geo_transition_state_matrix_times %>% 
+  t() %>% 
+  kable()
+
+geo_transition_state_matrix_counts <- gt_geo_simmap_summary$count %>%
+  as.data.frame() %>%
+  summarise(across(2:dim(.)[2]-1, mean))
+
+geo_transition_state_matrix_counts %>% 
+  t() %>%
+  kable()
+
+geo_transition_state_matrix_times %>% kable()
+
+# Plot transition counts
+geo_transition_state_matrix_counts %>%
+  t() %>%
+  as.data.frame() %>%
+  rownames_to_column(var="Geography") %>%
+  filter(Geography!="N") %>%
+  separate(Geography, into=c("Country_1","Country_2"), sep=",") %>%
+  rename(mean_count = V1) %>%
+  type_convert() %>%
+  ggplot(aes(x=Country_1, y=Country_2, fill=mean_count)) +
+  geom_tile() + 
+  geom_text(aes(label = mean_count), color = "black", size = 4) +
+  theme_classic() + 
+  scale_fill_distiller(palette = "YlOrRd") + 
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) + 
+  ggtitle("simmap geography transition state matrix")
+
+# Write transitions to file
+write.csv(geo_transition_state_matrix_times, "Geographic_simmap_transitions_times.csv")
+write.csv(geo_transition_state_matrix_counts, "Geographic_simmap_transitions_counts.csv")
+
+
+```
