@@ -11,7 +11,9 @@ This repository contains exemplar 'proof-of-concept' code for reconstruction the
 ![image](https://user-images.githubusercontent.com/8507671/225904674-86b12bed-d9b6-455e-8dff-3fa1c860708e.png)
 
 ### Regional frequencies of AMR emergence, import, and export   
-[Regional_event_heatmap_2024-07-24.pdf](https://github.com/user-attachments/files/16428936/Regional_event_heatmap_2024-07-24.pdf)
+<img width="1212" src="https://github.com/user-attachments/assets/3f7162f6-9140-4b41-8bcb-99abb6749620">
+
 
 ## Temporal frequencies of AMR emergence, import, and export
-[Dated_region_events_2024-07-24.pdf](https://github.com/user-attachments/files/16428946/Dated_region_events_2024-07-24.pdf)
+<img width="1209" src="https://github.com/user-attachments/assets/f4771093-6194-4305-b97e-37b47654d6e9">
+
