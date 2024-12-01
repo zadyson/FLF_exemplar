@@ -1,4 +1,4 @@
-# LSHTM FLF EIO exemplar
+# LSHTM FLF EOI exemplar
 
 ## Description
 This repository contains exemplar 'proof-of-concept' code for reconstruction the evolutionary, temporal and geogrpahic origin of AMR determinants.  Inputs are a dated phylogeny and associated metadata (year and country). Outputs are csv files detailing for each inferred ancestral node the most likley geographic origin, estimated divergence date, and presence or absence of an AMR determinant.  Data can be visualsied to show pathogen emergence and spread.
